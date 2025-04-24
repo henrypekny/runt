@@ -129,7 +129,7 @@ func (e *Engine) Run() {
 				}
 
 				// take a snapshot for interpolation
-				for _, ent := range CurrentWorld.entities {
+				for _, ent := range CurrentWorld.Entities() {
 					if s, ok := ent.(interface{ Snapshot() }); ok {
 						s.Snapshot()
 					}
