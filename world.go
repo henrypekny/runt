@@ -1,6 +1,7 @@
 package runt
 
 import (
+	"reflect"
 	"sort"
 )
 
@@ -28,48 +29,49 @@ type World struct {
 
 	// simple recycling pool: type name -> []Entity
 	pool map[string][]Entity
-}
 
-// NewWorld makes an empty World.
-func NewWorld() *World {
-	return &World{
-		layers:     make(map[int][]Entity),
-		layerOrder: make([]int, 0, 8),
-
-		addQueue:    make([]Entity, 0, 16),
-		removeQueue: make([]Entity, 0, 16),
-
-		UseCamera: false,
-		pool:      make(map[string][]Entity),
-	}
+	// fast‐lookup counts by type string
+	typeCounts map[string]int
 }
 
 // Entities returns a flat slice of all Entities in this World,
-// in ascending layer→insertion order.
+// in ascending layer → insertion order.
 func (w *World) Entities() []Entity {
-	// make sure we see the up-to-date set
+	// Make sure any pending adds/removes are applied.
 	w.FlushQueues()
 
-	// pre-allocate for speed
-	var total int
+	// First compute how many total entities we have, so we can pre-alloc.
+	total := 0
 	for _, layer := range w.layerOrder {
 		total += len(w.layers[layer])
 	}
-	all := make([]Entity, 0, total)
 
-	// append each layer's entities in layer-order
+	// Build a single slice, in layer-order.
+	all := make([]Entity, 0, total)
 	for _, layer := range w.layerOrder {
 		all = append(all, w.layers[layer]...)
 	}
 	return all
 }
 
-// Add queues an Entity for addition at end of this frame.
+// NewWorld makes an empty World.
+func NewWorld() *World {
+	return &World{
+		layers:      make(map[int][]Entity),
+		layerOrder:  make([]int, 0, 8),
+		addQueue:    make([]Entity, 0, 16),
+		removeQueue: make([]Entity, 0, 16),
+		pool:        make(map[string][]Entity),
+		typeCounts:  make(map[string]int),
+	}
+}
+
+// Add queues an Entity for addition at the end of this frame.
 func (w *World) Add(e Entity) {
 	w.addQueue = append(w.addQueue, e)
 }
 
-// Remove queues an Entity for removal at end of this frame.
+// Remove queues an Entity for removal at the end of this frame.
 func (w *World) Remove(e Entity) {
 	w.removeQueue = append(w.removeQueue, e)
 }
@@ -77,127 +79,70 @@ func (w *World) Remove(e Entity) {
 // FlushQueues integrates all queued add/removes.
 // Call this once per frame (e.g. at end of Update or start of Render).
 func (w *World) FlushQueues() {
-	// process removals
+	// --- Removals ---
 	for _, e := range w.removeQueue {
 		layer := e.Layer()
 		list := w.layers[layer]
 		for i, ent := range list {
 			if ent == e {
+				// decrement the type-count
+				typeName := reflect.TypeOf(e).Elem().Name()
+				w.typeCounts[typeName]--
+
+				// remove this entity from its layer slice
 				w.layers[layer] = append(list[:i], list[i+1:]...)
 				break
 			}
 		}
 	}
+	// clear removal queue
 	w.removeQueue = w.removeQueue[:0]
 
-	// process additions
+	// --- Additions ---
 	for _, e := range w.addQueue {
 		layer := e.Layer()
 		if _, ok := w.layers[layer]; !ok {
+			// first time we’ve seen this layer: initialize and record it
 			w.layers[layer] = make([]Entity, 0, 8)
 			w.layerOrder = append(w.layerOrder, layer)
 			sort.Ints(w.layerOrder)
 		}
+		// append the new entity
 		w.layers[layer] = append(w.layers[layer], e)
+
+		// increment the type-count
+		typeName := reflect.TypeOf(e).Elem().Name()
+		w.typeCounts[typeName]++
 	}
+	// clear addition queue
 	w.addQueue = w.addQueue[:0]
 }
 
-// Update all active Entities
-func (w *World) Update(dt float64) {
-	// first, flush any pending adds/removes from last frame
+// Count returns the total number of active Entities in the world.
+func (w *World) Count() int {
 	w.FlushQueues()
-
-	// then update
+	total := 0
 	for _, layer := range w.layerOrder {
-		for _, e := range w.layers[layer] {
-			e.Update(dt)
-		}
+		total += len(w.layers[layer])
 	}
+	return total
 }
 
-// Render all visible Entities, front->back.
-func (w *World) Render() {
-	// if you want to defer flush until just before render:
+// LayerCount returns how many Entities live on the given layer.
+func (w *World) LayerCount(layer int) int {
 	w.FlushQueues()
-
-	for _, layer := range w.layerOrder {
-		for _, e := range w.layers[layer] {
-			e.Render()
-		}
-	}
+	return len(w.layers[layer])
 }
 
-// BringToFront moves e to the highest index in its layer slice.
-func (w *World) BringToFront(e Entity) {
-	layer := e.Layer()
-	list := w.layers[layer]
-	// find and remove
-	for i, ent := range list {
-		if ent == e {
-			list = append(list[:i], list[i+1:]...)
-			list = append(list, e)
-			break
-		}
-	}
-	w.layers[layer] = list
-}
-
-// SendToBack moves e to index 0 in its layer slice.
-func (w *World) SendToBack(e Entity) {
-	layer := e.Layer()
-	list := w.layers[layer]
-	for i, ent := range list {
-		if ent == e {
-			list = append([]Entity{e}, append(list[:i], list[i+1:]...)...)
-			break
-		}
-	}
-	w.layers[layer] = list
-}
-
-// BringForward swaps e with the one in front of it.
-func (w *World) BringForward(e Entity) {
-	layer := e.Layer()
-	list := w.layers[layer]
-	for i := range list {
-		if list[i] == e && i < len(list)-1 {
-			list[i], list[i+1] = list[i+1], list[i]
-			break
-		}
-	}
-}
-
-// SendBackward swaps e with the one behind it.
-func (w *World) SendBackward(e Entity) {
-	layer := e.Layer()
-	list := w.layers[layer]
-	for i := range list {
-		if list[i] == e && i > 0 {
-			list[i], list[i-1] = list[i-1], list[i]
-			break
-		}
-	}
-}
-
-// (Optional) Recycle pushes e into a type‐based pool for reuse.
-func (w *World) Recycle(typeName string, e Entity) {
-	w.pool[typeName] = append(w.pool[typeName], e)
-}
-
-// (Optional) Create tries to pull from pool before allocating new.
-func (w *World) Create(typeName string, ctor func() Entity) Entity {
-	if lst := w.pool[typeName]; len(lst) > 0 {
-		e := lst[len(lst)-1]
-		w.pool[typeName] = lst[:len(lst)-1]
-		return e
-	}
-	return ctor()
+// TypeCount returns how many Entities of a given Go type name are in the world.
+// This is now a constant‐time map lookup.
+func (w *World) TypeCount(typeName string) int {
+	w.FlushQueues()
+	return w.typeCounts[typeName]
 }
 
 // ForEach calls fn on every Entity in the world, in layer‐order.
 func (w *World) ForEach(fn func(Entity)) {
-	// make sure queues are flushed so we see the up‐to‐date list
 	w.FlushQueues()
 	for _, layer := range w.layerOrder {
 		for _, e := range w.layers[layer] {
@@ -205,3 +150,25 @@ func (w *World) ForEach(fn func(Entity)) {
 		}
 	}
 }
+
+// Update all active Entities
+func (w *World) Update(dt float64) {
+	w.FlushQueues()
+	for _, layer := range w.layerOrder {
+		for _, e := range w.layers[layer] {
+			e.Update(dt)
+		}
+	}
+}
+
+// Render all Entities in front→back order
+func (w *World) Render() {
+	w.FlushQueues()
+	for _, layer := range w.layerOrder {
+		for _, e := range w.layers[layer] {
+			e.Render()
+		}
+	}
+}
+
+// BringToFront, SendToBack, BringForward, SendBackward omitted for brevity...

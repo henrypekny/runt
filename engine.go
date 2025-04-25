@@ -1,4 +1,3 @@
-// runt/engine.go
 package runt
 
 import (
@@ -10,9 +9,10 @@ import (
 )
 
 // Game is your application’s entrypoint interface.
-//   - Create() is called once at startup.
-//   - Update(dt) is called one or more times per frame (dt = seconds).
-//   - Draw(interp) is called every frame; interp is 0–1 in fixed mode, always 0 in variable mode.
+//
+//	– Create()   is called once at startup.
+//	– Update(dt) is called one or more times per frame (dt = seconds).
+//	– Draw(interp) is called every frame; interp is 0–1 in fixed mode, always 0 in variable mode.
 type Game interface {
 	Create()
 	Update(dt float64)
@@ -20,20 +20,26 @@ type Game interface {
 }
 
 // Engine drives the window, main loop, timing and background.
+// It supports both fixed‐timestep (with interpolation) and variable‐timestep modes.
 type Engine struct {
-	game         Game
-	title        string
-	fps          int
-	bg           rl.Color
-	fixed        bool
-	tickRate     time.Duration
-	maxElapsed   float64 // clamp on dt to avoid spiral-of-death
-	maxFrameSkip int
-	paused       bool
+	game         Game          // the user’s Game implementation
+	title        string        // window title
+	fps          int           // desired frame rate (and tick rate in fixed mode)
+	bg           Color         // clear color for the backbuffer (alias for rl.Color)
+	fixed        bool          // true → fixed‐timestep + interpolation
+	tickRate     time.Duration // time per physics tick (1/fps)
+	maxElapsed   float64       // clamp on dt to avoid spiral-of-death
+	maxFrameSkip int           // max physics steps per frame
+	paused       bool          // when true, Update(dt) is skipped
 }
 
-// NewEngine builds (but does not open) a windowed engine.
-// Pass fixed=true to enable fixed-timestep + interpolation.
+// NewEngine constructs an Engine but does not open the window.
+//
+//	w, h   – window dimensions
+//	title  – window title
+//	fps    – target framerate (also physics tick rate in fixed mode)
+//	game   – your Game instance
+//	fixed  – whether to use fixed‐timestep + interpolation
 func NewEngine(
 	w, h int,
 	title string,
@@ -41,6 +47,7 @@ func NewEngine(
 	game Game,
 	fixed bool,
 ) *Engine {
+	// Configure our package-level state (screen size, FPS)
 	Resize(w, h)
 	AssignedFPS = fps
 
@@ -48,52 +55,54 @@ func NewEngine(
 		game:         game,
 		title:        title,
 		fps:          fps,
-		bg:           BackgroundColor,
-		fixed:        fixed,
+		bg:           BackgroundColor, // default from palette.go
+		fixed:        fixed,           // fixed vs variable
 		tickRate:     time.Second / time.Duration(fps),
-		maxElapsed:   1.0 / 10.0, // clamp dt to 100ms
-		maxFrameSkip: 5,
-		paused:       false,
+		maxElapsed:   1.0 / 10.0, // clamp dt at 100ms
+		maxFrameSkip: 5,          // avoid too many physics steps
+		paused:       false,      // start unpaused
 	}
 }
 
 // Run opens the window, initializes audio, and enters the main loop.
+// It handles timing, update, interpolation, and drawing.
 func (e *Engine) Run() {
+	// --- Initialize Raylib ---
 	rl.InitWindow(int32(Width), int32(Height), e.title)
 	defer rl.CloseWindow()
-
 	rl.InitAudioDevice()
 	defer rl.CloseAudioDevice()
-
 	rl.SetTargetFPS(int32(e.fps))
 
-	// allow the game to set up
+	// Let the Game set itself up.
 	e.game.Create()
 
-	// rolling buffer for Δt statistics
+	// Buffer for dt statistics.
 	const sampleCount = 120
 	dts := make([]float64, 0, sampleCount)
-	frame := 0
 
 	previous := rl.GetTime()
 	var lag float64
 
+	// Main loop.
 	for !rl.WindowShouldClose() {
-		// --- 1) measure Δt ---
+		// ---- 1) Measure Δt ----
 		now := rl.GetTime()
 		dt := now - previous
 		previous = now
 
+		// Clamp dt to avoid spiral-of-death.
 		if dt > e.maxElapsed {
 			dt = e.maxElapsed
 		}
-		// record for stats
+
+		// Collect stats.
 		dts = append(dts, dt)
 		if len(dts) > sampleCount {
 			dts = dts[1:]
 		}
-		frame++
-		if frame%sampleCount == 0 && len(dts) == sampleCount {
+		if len(dts) == sampleCount {
+			// Print min/max/mean/stddev every sampleCount frames.
 			min, max, sum := dts[0], dts[0], 0.0
 			for _, v := range dts {
 				if v < min {
@@ -107,49 +116,53 @@ func (e *Engine) Run() {
 			mean := sum / sampleCount
 			varVariance := 0.0
 			for _, v := range dts {
-				diff := v - mean
-				varVariance += diff * diff
+				d := v - mean
+				varVariance += d * d
 			}
 			stddev := math.Sqrt(varVariance / sampleCount)
-			fmt.Printf("[%s] dt over last %d frames: min=%.5f  max=%.5f  mean=%.5f  σ=%.5f\n",
+			fmt.Printf("[%s] dt over last %d frames: min=%.5f max=%.5f mean=%.5f σ=%.5f\n",
 				time.Now().Format("15:04:05"), sampleCount, min, max, mean, stddev)
+			dts = dts[:0]
 		}
 
-		// --- 2) update ---
+		// Apply any global time‐scale.
 		Elapsed = dt * Rate
+
+		// ---- 2) Update ----
 		if !e.paused {
 			if e.fixed {
-				// accumulate unprocessed time
+				// Fixed‐timestep mode.
 				lag += dt
 				step := e.tickRate.Seconds()
 
-				// avoid spiral
+				// Cap physics steps.
 				if lag > step*float64(e.maxFrameSkip) {
 					lag = step * float64(e.maxFrameSkip)
 				}
 
-				// take a snapshot for interpolation
+				// Snapshot all entities for interpolation.
 				for _, ent := range CurrentWorld.Entities() {
 					if s, ok := ent.(interface{ Snapshot() }); ok {
 						s.Snapshot()
 					}
 				}
 
-				// run fixed-size physics steps
+				// Run fixed‐size physics steps.
 				for lag >= step {
 					e.game.Update(step)
 					lag -= step
 				}
 			} else {
-				// variable-timestep
+				// Variable‐timestep mode.
 				e.game.Update(dt)
 			}
 		}
 
-		// --- 3) render ---
+		// ---- 3) Render ----
 		rl.BeginDrawing()
-		rl.ClearBackground(e.bg)
+		rl.ClearBackground(e.bg) // Color is our alias for rl.Color
 
+		// Camera transform.
 		camX, camY := CurrentWorld.CameraX, CurrentWorld.CameraY
 		rl.BeginMode2D(rl.NewCamera2D(
 			rl.Vector2{X: camX, Y: camY},
@@ -157,13 +170,12 @@ func (e *Engine) Run() {
 			0, 1,
 		))
 
+		// Draw with interpolation factor.
 		if e.fixed {
-			// pass interpolation α = lag/step to Draw
 			alpha := float32(lag / e.tickRate.Seconds())
 			Interp = alpha
 			e.game.Draw(alpha)
 		} else {
-			// no interpolation
 			Interp = 0
 			e.game.Draw(0)
 		}
@@ -171,22 +183,22 @@ func (e *Engine) Run() {
 		rl.EndMode2D()
 		rl.EndDrawing()
 
-		// --- 4) FPS ---
+		// ---- 4) FPS ----
 		FrameRate = float64(rl.GetFPS())
 	}
 }
 
-// SetBackground changes the clear color at runtime.
-func (e *Engine) SetBackground(c rl.Color) {
+// SetBackground updates the clear color at runtime.
+func (e *Engine) SetBackground(c Color) {
 	e.bg = c
 }
 
-// Pause suspends calls to Update(dt).
+// Pause suspends further Update(dt) calls until Resume() is called.
 func (e *Engine) Pause() {
 	e.paused = true
 }
 
-// Resume re-enables calls to Update(dt).
+// Resume re‐enables Update(dt) calls.
 func (e *Engine) Resume() {
 	e.paused = false
 }
